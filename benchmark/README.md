@@ -14,6 +14,10 @@ original 38-feature schema and pretrained model are unchanged.
 - `tests/test_core.py`: deterministic fixture data and explicit expected outcomes.
 - `tests/test_hardening.py`: acquisition/alias, uncertain-event and evaluation
   provenance regressions, including time origins and input-order invariance.
+- `legacy_ids.py`: strict M1.1 offline CSV adapter; see [LEGACY_IDS.md](LEGACY_IDS.md)
+  for supported formats, required external metadata and conversion blockers.
+- `tests/test_legacy_ids.py`, `tests/fixtures/legacy_*.csv`: deterministic adapter
+  tests and synthetic examples of verified legacy CSV layouts.
 - `__init__.py`, `tests/__init__.py`: package markers and schema version.
 
 ## Run the deterministic validation
