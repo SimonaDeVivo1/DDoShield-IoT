@@ -22,7 +22,8 @@ MODEL = digest("fixture model; no model is loaded")
 
 def manifest(run_id="run-1", split=Split.TEST, source=None):
     source = source or SourceArtifact(
-        f"capture-{run_id}", digest(run_id), f"fixture://{run_id}", (digest(run_id),),
+        f"capture-{run_id}", f"acquisition-{run_id}", digest(run_id),
+        f"fixture://{run_id}", (f"acquisition-{run_id}",),
     )
     return RunMetadata(
         experiment_id="experiment-1", run_id=run_id, scenario_id="fixture-scenario",
@@ -37,10 +38,10 @@ def manifest(run_id="run-1", split=Split.TEST, source=None):
 
 
 def observation(run, ordinal, timestamp=10, port=80, unit=Unit.PACKET):
-    source_id = run.sources[0].source_id
+    source = run.sources[0]
     return Observation(
-        run.run_id, source_id, ordinal,
-        stable_sample_id(run.run_id, source_id, ordinal, unit),
+        run.run_id, source.source_id, source.acquisition_id, ordinal,
+        stable_sample_id(run.run_id, source.acquisition_id, ordinal, unit),
         timestamp, run.clock_id, unit, {"DstPort": port, "PacketSize": 64},
     )
 
@@ -75,6 +76,7 @@ def truth(run, obs, state, overlap=False):
     if state is Label.UNKNOWN:
         return GroundTruth(run.run_id, obs.sample_id, state,
                            ("benign-origin", "attack-origin"),
+                           candidate_event_ids=("event-1",),
                            ambiguity_reason="two unresolved provenance candidates")
     if state is Label.BENIGN:
         return GroundTruth(run.run_id, obs.sample_id, state, ("benign-origin",))
@@ -151,7 +153,7 @@ class EvaluationTests(unittest.TestCase):
         self.assertIsNone(result.fpr)
         with self.assertRaises(ContractError):
             self.evaluate((item,), (replace(label, state=Label.MALICIOUS,
-                ambiguity_reason=None, attack_event_ids=("event-1",)),), ())
+                ambiguity_reason=None, confirmed_event_ids=("event-1",)),), ())
 
     def test_overlapping_events_count_packet_once(self):
         item = observation(self.run, 0, timestamp=25)
@@ -162,7 +164,7 @@ class EvaluationTests(unittest.TestCase):
         window = summarize_windows(self.run, (item,), (label,), self.origins,
                                    self.events, width_ns=100)[0]
         self.assertEqual(window.n_malicious, 1)
-        self.assertEqual(window.attack_event_ids, ("event-1", "event-2"))
+        self.assertEqual(window.confirmed_event_ids, ("event-1", "event-2"))
 
     def test_mixed_packet_window_retains_both_labels(self):
         items = (observation(self.run, 0, timestamp=20, port=80),
@@ -252,8 +254,8 @@ class EvaluationTests(unittest.TestCase):
         item = observation(self.run, 0)
         label = truth(self.run, item, Label.MALICIOUS)
         for broken in (replace(label, provenance_ids=("absent",)),
-                       replace(label, attack_event_ids=("absent",)),
-                       replace(label, attack_event_ids=("event-2",))):
+                       replace(label, confirmed_event_ids=("absent",)),
+                       replace(label, confirmed_event_ids=("event-2",))):
             with self.assertRaises(ContractError):
                 self.evaluate((item,), (broken,), ())
         origins = (replace(self.origins[1], actor_id="unrelated-actor"),)
@@ -298,16 +300,13 @@ class ContractTests(unittest.TestCase):
                 manifest("test-run", Split.TEST))
         validate_partitions(runs)
 
-    def test_shared_source_content_or_ancestor_fails(self):
+    def test_shared_acquisition_or_ancestor_fails(self):
         train = manifest("train-run", Split.TRAIN)
         original = train.sources[0]
-        reused_id = SourceArtifact(original.source_id, digest("new"), "fixture://new",
-                                   (digest("new"),))
-        reused_content = SourceArtifact("renamed-source", original.sha256, "fixture://copy",
-                                        (original.sha256,))
-        derived = SourceArtifact("derived-source", digest("derived"), "fixture://derived",
-                                 original.root_sha256s)
-        for source in (reused_id, reused_content, derived):
+        reused_acquisition = replace(original, source_id="renamed-source", uri="fixture://copy")
+        derived = SourceArtifact("derived-source", "derived-acquisition", digest("derived"),
+                                 "fixture://derived", original.root_acquisition_ids)
+        for source in (reused_acquisition, derived):
             with self.subTest(source=source.source_id):
                 with self.assertRaises(ContractError):
                     validate_partitions((train, manifest("test-run", Split.TEST, source)))
@@ -358,7 +357,8 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             frozen.network["nested"]["new"] = 3
         item = observation(run, 0)
-        for name in ("Label", "ground_truth", "attack_event_ids", "provenance_ids", "split"):
+        for name in ("Label", "ground_truth", "attack_event_ids", "confirmed_event_ids",
+                     "candidate_event_ids", "provenance_ids", "split"):
             with self.assertRaises(ContractError):
                 replace(item, features={name: "not observable"})
         self.assertNotIn("Label", json.loads(to_json(item))["features"])

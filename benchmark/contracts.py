@@ -1,4 +1,4 @@
-"""Validated immutable records and provenance checks for benchmark v0.1."""
+"""Validated immutable records and provenance checks for benchmark v0.1.1."""
 
 from __future__ import annotations
 
@@ -114,32 +114,59 @@ def to_json(record: Any) -> str:
     return json.dumps(plain(record), sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-def stable_sample_id(run_id: str, source_id: str, ordinal: int, unit: Unit) -> str:
-    """Identity is the source occurrence, never its label, features, or prediction."""
+def stable_sample_id(run_id: str, acquisition_id: str, ordinal: int, unit: Unit) -> str:
+    """Identity is a canonical acquisition occurrence, never content or an alias."""
     _text(run_id, "run_id")
-    _text(source_id, "source_id")
+    _text(acquisition_id, "acquisition_id")
     _integer(ordinal, "ordinal")
     _enum(unit, Unit, "unit")
-    encoded = json.dumps([run_id, source_id, ordinal, unit.value], separators=(",", ":"))
+    encoded = json.dumps([run_id, acquisition_id, ordinal, unit.value], separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
 class SourceArtifact:
-    source_id: str
-    sha256: str
+    source_id: str  # run-local import name; aliases explicitly point to a canonical source
+    acquisition_id: str  # globally stable acquisition identity, independent of bytes
+    sha256: str  # complete artifact content identity; not packet occurrence identity
     uri: str
-    root_sha256s: tuple[str, ...]  # original captures/datasets, including all shared ancestors
+    root_acquisition_ids: tuple[str, ...]  # all shared underlying observation ancestry
+    alias_of: str | None = None
     schema_version: str = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         _version(self.schema_version)
         _text(self.source_id, "source_id")
+        _text(self.acquisition_id, "acquisition_id")
         _text(self.uri, "uri")
         _sha(self.sha256)
-        _strings(self.root_sha256s, "root_sha256s", required=True)
-        for root in self.root_sha256s:
-            _sha(root)
+        _strings(self.root_acquisition_ids, "root_acquisition_ids", required=True)
+        if self.alias_of is not None:
+            _text(self.alias_of, "alias_of")
+            if self.alias_of == self.source_id:
+                raise ContractError("source alias cannot refer to itself")
+
+
+def _validate_sources(sources: tuple[SourceArtifact, ...]) -> None:
+    if not isinstance(sources, tuple) or not sources or any(
+        not isinstance(source, SourceArtifact) for source in sources
+    ):
+        raise ContractError("sources must be a nonempty tuple of SourceArtifact records")
+    by_id = {source.source_id: source for source in sources}
+    if len(by_id) != len(sources):
+        raise ContractError("duplicate source_id in run")
+    canonical = [source for source in sources if source.alias_of is None]
+    if len({source.acquisition_id for source in canonical}) != len(canonical):
+        raise ContractError("an acquisition must have exactly one canonical source")
+    for source in sources:
+        if source.alias_of is None:
+            continue
+        target = by_id.get(source.alias_of)
+        if target is None or target.alias_of is not None:
+            raise ContractError("alias must refer directly to an existing canonical source")
+        if (source.acquisition_id != target.acquisition_id or source.sha256 != target.sha256
+                or set(source.root_acquisition_ids) != set(target.root_acquisition_ids)):
+            raise ContractError("alias acquisition, content or lineage differs from canonical source")
 
 
 @dataclass(frozen=True)
@@ -174,12 +201,7 @@ class RunMetadata:
         _enum(self.split, Split, "split")
         _sha(self.model_sha256)
         _score(self.decision_threshold, "decision_threshold")
-        if not isinstance(self.sources, tuple) or not self.sources or any(
-            not isinstance(source, SourceArtifact) for source in self.sources
-        ):
-            raise ContractError("sources must be a nonempty tuple of SourceArtifact records")
-        if len({source.source_id for source in self.sources}) != len(self.sources):
-            raise ContractError("duplicate source_id in run")
+        _validate_sources(self.sources)
         for name in ("network", "traffic", "attack_scenario", "ids", "software", "hardware"):
             _settings(self, name)
 
@@ -188,6 +210,7 @@ class RunMetadata:
 class Observation:
     run_id: str
     source_id: str
+    acquisition_id: str
     ordinal: int
     sample_id: str
     timestamp_ns: int
@@ -199,13 +222,15 @@ class Observation:
     def __post_init__(self) -> None:
         _version(self.schema_version)
         _integer(self.timestamp_ns, "timestamp_ns")
+        _text(self.source_id, "source_id")
         _text(self.clock_id, "clock_id")
-        expected = stable_sample_id(self.run_id, self.source_id, self.ordinal, self.unit)
+        expected = stable_sample_id(self.run_id, self.acquisition_id, self.ordinal, self.unit)
         if self.sample_id != expected:
             raise ContractError("sample_id does not match its stable source occurrence")
         _settings(self, "features", required=False)
         # Dedicated fields belong in separate truth/provenance records, not observations.
-        forbidden = {"label", "ground_truth", "attack_event_ids", "provenance_ids", "split"}
+        forbidden = {"label", "ground_truth", "attack_event_ids", "confirmed_event_ids",
+                     "candidate_event_ids", "provenance_ids", "split"}
         if forbidden.intersection(key.lower() for key in self.features):
             raise ContractError("ground truth or partition metadata in observable features")
 
@@ -241,7 +266,8 @@ class TrafficProvenance:
     actor_id: str
     state: Label
     evidence_ids: tuple[str, ...]
-    attack_event_ids: tuple[str, ...] = ()
+    confirmed_event_ids: tuple[str, ...] = ()
+    candidate_event_ids: tuple[str, ...] = ()
     schema_version: str = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -250,11 +276,20 @@ class TrafficProvenance:
             _text(getattr(self, name), name)
         _enum(self.state, Label, "state")
         _strings(self.evidence_ids, "evidence_ids", required=True)
-        _strings(self.attack_event_ids, "attack_event_ids")
-        if self.state is Label.MALICIOUS and not self.attack_event_ids:
+        _event_associations(self.confirmed_event_ids, self.candidate_event_ids)
+        if self.state is Label.MALICIOUS and not self.confirmed_event_ids:
             raise ContractError("malicious provenance requires attack event membership")
-        if self.state is Label.BENIGN and self.attack_event_ids:
-            raise ContractError("benign provenance cannot claim attack membership")
+        if self.state is Label.UNKNOWN and self.confirmed_event_ids:
+            raise ContractError("unknown provenance cannot confirm attack membership")
+        if self.state is Label.BENIGN and (self.confirmed_event_ids or self.candidate_event_ids):
+            raise ContractError("benign provenance cannot claim confirmed or candidate attacks")
+
+
+def _event_associations(confirmed: tuple[str, ...], candidates: tuple[str, ...]) -> None:
+    _strings(confirmed, "confirmed_event_ids")
+    _strings(candidates, "candidate_event_ids")
+    if set(confirmed).intersection(candidates):
+        raise ContractError("confirmed and candidate event associations must be disjoint")
 
 
 @dataclass(frozen=True)
@@ -263,7 +298,8 @@ class GroundTruth:
     sample_id: str
     state: Label
     provenance_ids: tuple[str, ...]
-    attack_event_ids: tuple[str, ...] = ()
+    confirmed_event_ids: tuple[str, ...] = ()
+    candidate_event_ids: tuple[str, ...] = ()
     ambiguity_reason: str | None = None
     schema_version: str = SCHEMA_VERSION
 
@@ -273,15 +309,17 @@ class GroundTruth:
         _text(self.sample_id, "sample_id")
         _enum(self.state, Label, "state")
         _strings(self.provenance_ids, "provenance_ids", required=self.state is not Label.UNKNOWN)
-        _strings(self.attack_event_ids, "attack_event_ids")
+        _event_associations(self.confirmed_event_ids, self.candidate_event_ids)
         if self.state is Label.UNKNOWN:
             _text(self.ambiguity_reason, "ambiguity_reason")
+            if self.confirmed_event_ids:
+                raise ContractError("unknown truth cannot confirm attack membership")
         elif self.ambiguity_reason is not None:
             raise ContractError("known truth cannot carry an ambiguity reason")
-        if self.state is Label.MALICIOUS and not self.attack_event_ids:
+        if self.state is Label.MALICIOUS and not self.confirmed_event_ids:
             raise ContractError("malicious truth requires event membership")
-        if self.state is Label.BENIGN and self.attack_event_ids:
-            raise ContractError("benign truth cannot claim attack membership")
+        if self.state is Label.BENIGN and (self.confirmed_event_ids or self.candidate_event_ids):
+            raise ContractError("benign truth cannot claim confirmed or candidate attacks")
 
 
 @dataclass(frozen=True)
@@ -317,9 +355,10 @@ class Prediction:
 
 
 def validate_partitions(runs: tuple[RunMetadata, ...]) -> None:
-    """Reject shared source identities, content, or declared roots across splits."""
+    """Reject shared acquisitions/ancestry across splits, not equal packet contents."""
     seen_runs: set[str] = set()
-    owners: dict[tuple[str, str], Split] = {}
+    owners: dict[str, Split] = {}
+    definitions: dict[str, tuple[str, frozenset[str]]] = {}
     for run in runs:
         if not isinstance(run, RunMetadata):
             raise ContractError("partitions require RunMetadata records")
@@ -327,8 +366,11 @@ def validate_partitions(runs: tuple[RunMetadata, ...]) -> None:
             raise ContractError(f"duplicate run_id: {run.run_id}")
         seen_runs.add(run.run_id)
         for source in run.sources:
-            keys = [("id", source.source_id), ("hash", source.sha256)]
-            keys.extend(("hash", root) for root in source.root_sha256s)
+            definition = (source.sha256, frozenset(source.root_acquisition_ids))
+            if source.acquisition_id in definitions and definitions[source.acquisition_id] != definition:
+                raise ContractError("acquisition has inconsistent content or lineage across runs")
+            definitions[source.acquisition_id] = definition
+            keys = (source.acquisition_id, *source.root_acquisition_ids)
             for key in keys:
                 if key in owners and owners[key] is not run.split:
                     raise ContractError(f"source provenance crosses partitions: {key}")
