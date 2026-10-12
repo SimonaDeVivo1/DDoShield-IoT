@@ -619,3 +619,4 @@ PRs and issues are welcome!
 ## Contact
 
 * Islam Obaidat — [iaobaidat@ncat.edu](mailto:iaobaidat@ncat.edu)
+* Simona De Vivo - [s.devivo@unifortunato.eu](mailto:s.devivo@unifortunato.eu)
