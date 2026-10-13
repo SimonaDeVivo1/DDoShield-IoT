@@ -18,6 +18,8 @@ original 38-feature schema and pretrained model are unchanged.
   for supported formats, required external metadata and conversion blockers.
 - `tests/test_legacy_ids.py`, `tests/fixtures/legacy_*.csv`: deterministic adapter
   tests and synthetic examples of verified legacy CSV layouts.
+- `acquisition.py`, `tests/test_acquisition.py`: offline M1.2a evidence reconciliation;
+  see [ACQUISITION.md](ACQUISITION.md) for guarantees, clock rules and capture limitations.
 - `__init__.py`, `tests/__init__.py`: package markers and schema version.
 
 ## Run the deterministic validation
